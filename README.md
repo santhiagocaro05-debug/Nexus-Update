@@ -1,0 +1,585 @@
+<div align="center">
+
+<img src="assets/OpenYTMusicBannerOriginal.png" alt="NexusMusic" width="100%"/>
+
+# NexusMusic
+
+**v0.6.4** · Cliente de YouTube Music · Material Design 3
+
+Un producto de **[Nexus Forge](https://nexusforgex.vercel.app)** (Nexus Studios)
+
+Desarrollado por: Nexus Studios
+
+</div>
+
+---
+
+> 🔒 **SOFTWARE PROPIETARIO — CÓDIGO CERRADO**
+> NexusMusic es un producto cerrado de Nexus Forge / Nexus Studios. El código fuente **no**
+> se publica ni se distribuye: solo se entrega el APK compilado y firmado. Todos los derechos
+> reservados. Si quieres verificar que el APK es seguro, puedes analizarlo con tu antivirus o
+> subirlo a un servicio como VirusTotal antes de instalarlo — no hace falta acceso al código
+> para confiar en la app. Los términos completos están en [`LICENSE`](LICENSE).
+
+---
+
+## Tabla de contenido
+
+1. [Stack técnico](#stack-técnico)
+2. [Arquitectura de módulos](#arquitectura-de-módulos)
+3. [Funciones](#funciones)
+4. [Escuchar juntos (salas)](#escuchar-juntos-salas)
+5. [Backend de control (analytics + nxmctl)](#backend-de-control-analytics--nxmctl)
+6. [Requisitos de build](#requisitos-de-build)
+7. [Variantes de build](#variantes-de-build)
+8. [Compilar paso a paso](#compilar-paso-a-paso)
+9. [Firmar el release](#firmar-el-release)
+10. [Instalar y probar](#instalar-y-probar)
+11. [Logs y diagnóstico](#logs-y-diagnóstico)
+12. [Resolución de streams y anti-bot](#resolución-de-streams-y-anti-bot)
+13. [Problemas comunes](#problemas-comunes)
+14. [API (YouTube Music / InnerTube)](#api-youtube-music--innertube)
+15. [Testear vía código](#testear-vía-código)
+16. [Un producto de Nexus Forge](#un-producto-de-nexus-forge)
+17. [Reportar problemas](#reportar-problemas)
+18. [Estado](#estado)
+19. [Licencia](#licencia)
+20. [Disclaimer](#disclaimer)
+
+## Stack técnico
+
+| Capa | Tecnología |
+|---|---|
+| Lenguaje | Kotlin (JVM target 17) |
+| UI | Jetpack Compose + Material Design 3 |
+| Reproducción | AndroidX Media3 (ExoPlayer) |
+| Persistencia | Room + DataStore (Preferences) |
+| Red | Ktor client + OkHttp |
+| Extracción de streams | Cliente InnerTube propio (rotación de clientes, streams muxed) |
+| Anti-bot | PoToken (BotGuard vía WebView) — módulo `zemer-cipher` |
+| Letras | LrcLib + KuGou + YouTube transcript (con fallback en cascada) |
+| RPC | Discord Rich Presence (módulo `discord-rpc`) |
+| Tema | Rojo YouTube Music (`#FF0000`), acento saturado, dark puro |
+| Build | Gradle 8.7 (wrapper) · AGP 8.6.0 · Kotlin 2.0.10 |
+| minSdk / targetSdk / compileSdk | 24 / 35 / 35 |
+| build-tools | 35.0.0 |
+
+## Arquitectura de módulos
+
+```
+NexusMusic/
+├── app/                      # Módulo principal (UI, navegación, reproductor, servicios)
+├── innertube/                # Cliente InnerTube: parseo de respuestas de YouTube Music
+├── zemer-cipher/             # Generación de PoToken (BotGuard en WebView) + firmas de streams
+├── selene/                   # Extracción alternativa (browse/search/next/streams); aún no la usa `app`
+├── lrclib/                   # Cliente de LrcLib (letras sincronizadas)
+├── kugou/                    # Cliente de KuGou (letras)
+├── discord-rpc/              # Gateway de Discord (Rich Presence)
+├── material-color-utilities/ # Utilidades de color Material (tema)
+├── analytics/                # Backend (FastAPI + Postgres): registro, baneo y salas
+│   ├── main.py               #   API de eventos, estado de acceso y administración
+│   ├── rooms.py               #   Salas de "escuchar juntos" (WebSocket + protocolo)
+│   ├── room_sim.py            #   Prueba con dos clientes reales (sin dependencias)
+│   ├── nxmctl.py              #   CLI para ver el registro desde cualquier máquina
+│   └── schema.sql             #   Tablas (eventos, redes y salas)
+├── landing/                  # Página de descarga (Netlify) y APK publicado
+└── desktop/                  # Variante de escritorio (experimental)
+```
+
+El módulo `app` depende de los módulos de extracción a través de `com.nexusmusic.app.innertube`
+y expone la lógica de negocio vía ViewModels (`com.nexusmusic.app.viewmodels`). La capa de
+reproducción vive en `com.nexusmusic.app.playback` (servicio de media, colas, radios).
+
+## Funciones
+
+- Búsqueda, reproducción y colas de YouTube Music (canciones, álbumes, artistas, playlists)
+- **Importar playlists y "Me gusta" desde la cuenta real de YouTube Music** (login con captura
+  manual de sesión: el usuario decide qué cuenta conectar)
+- Shuffle determinista: al activarlo, el salto aleatorio ocurre al terminar la pista o avanzar
+- Temporizador de sueño: barra de tiempo libre y "detener al terminar la canción" con contador real
+- Letras sincronizadas (LrcLib / KuGou / transcript) y sin sincronizar
+- **PoToken (BotGuard) como rescate automático cuando YouTube responde muro anti-bot**
+- Discord Rich Presence con timestamp tipo Spotify
+- **Escuchar juntos**: salas por código para oír la misma música al mismo tiempo, con chat
+  efímero (ver [abajo](#escuchar-juntos-salas))
+- **Control total**: registro anónimo de usuarios activos, búsquedas y reproducciones, con
+  baneo por red y CLI de administración (ver [abajo](#backend-de-control-analytics--nxmctl))
+- **Efecto cristal** en toda la app: barras de título, píldora de navegación, avisos y hojas
+  translúcidas (el contenido se adivina por debajo), con un canto de luz de un píxel y un brillo del
+  color que manda el tema arriba y abajo. El brillo va en **una sola capa por encima** del contenido:
+  translucir a la vez fondo, tarjetas y barras multiplica el color capa sobre capa y termina lavando
+  la pantalla (pasó al implementarlo). Se apaga en **Ajustes > Apariencia > Efecto cristal**
+- **Aviso de novedades** al actualizar, con opción de no volver a mostrarlo
+- Descargas offline (`ExoDownloadService` + `DownloadUtil` en `app`), colas, radios y mezcla infinita
+- Tema oscuro puro con acento rojo vivo y color dinámico opcional desde la portada
+
+## Escuchar juntos (salas)
+
+Dos (hasta cuatro) teléfonos oyen **la misma canción, en el mismo segundo**. Uno crea una sala,
+comparte el código de 6 caracteres y el otro entra con él.
+
+**No es una llamada de audio.** No se transmite sonido: cada teléfono reproduce su propio
+stream de YouTube Music y entre ellos solo viaja el estado de reproducción (~50 bytes por
+mensaje: qué canción, en qué segundo y si suena). Por eso sincronizar no cuesta ancho de banda
+y la calidad es la misma que escuchando solo.
+
+| Pieza | Cómo funciona |
+|---|---|
+| Código de sala | 6 caracteres, sin `I/O/0/1` (para dictarlo sin errores). La sala dura 24 h y **sigue viva si uno sale**. |
+| El servidor es el reloj | Cada mensaje sale sellado con la hora del servidor. El invitado calcula en qué segundo debería ir: corrige el desfase de relojes **y** la latencia en una sola cuenta. |
+| Arranque en dos tiempos | Al cambiar de canción, los dos la cargan **en pausa** y avisan. Solo cuando el último avisa, el servidor manda **una única hora de arranque** para los dos. Nada suena antes: así no se oye a uno empezar solo ni al otro reiniciarlo encima. |
+| Corrección de deriva | Por debajo de 150 ms no se toca nada; entre 150 y 700 ms se ajusta la velocidad un 3 % (inaudible); solo se salta (seek) si de verdad se desincronizó. |
+| Los dos controlan | Pausa, siguiente/anterior, la barra de progreso y el buscador de la sala viajan a los dos lados, con guardas para que nada rebote de vuelta. |
+| Anti-fantasma | La app manda el UUID de su instalación al entrar: si el socket se cae y vuelve, el servidor **reemplaza** la conexión anterior (si no, el mismo teléfono aparecía dos veces y frenaba el arranque). Un barrido saca a quien desaparece de golpe. |
+| Buscador propio | Lupa dentro de la sala, con **predicciones** mientras escribes. Elegir una canción la pone en los dos y arranca sincronizada. |
+| Chat efímero | Se retransmite en vivo y **no se guarda** ni una línea. Trae indicador de escritura (puntitos) y avisos de entrada/salida. |
+| Foto de perfil | Al tocar tu ficha eliges una foto del teléfono: se recorta cuadrada, se comprime a 128 px y viaja por la sala en base64 (unos pocos KB). **No se guarda en el servidor** (vive en memoria mientras la sala existe, con tope de tamaño y solo base64) y se puede quitar cuando quieras. |
+
+El socket vive en `MusicService`, no en la pantalla: la sincronización sigue con la app en
+segundo plano o el teléfono bloqueado, que es cuando de verdad se escucha música.
+
+**Archivos:** `analytics/rooms.py` (servidor), `app/.../utils/ListeningRoom.kt` (cliente),
+`app/.../ui/screens/room/ListeningRoomScreen.kt` (pantalla), `app/.../playback/MusicService.kt`
+(motor de sincronía) y `analytics/room_sim.py` (prueba con dos clientes reales).
+
+```bash
+# Prueba del protocolo sin tocar el teléfono: dos clientes, contra el servidor real
+cd analytics && python3 room_sim.py https://nexusmusic-analytics.onrender.com
+```
+
+## Backend de control (analytics + nxmctl)
+
+Servicio ultraligero (FastAPI + Postgres) que sostiene dos cosas: el **registro de uso** y las
+**salas**. Está desplegado en Render (plan gratis, `render.yaml` en la raíz) y la app se
+compila apuntando a él con `-PnxmAnalyticsUrl=https://...`.
+
+- **Registro**: latido diario, búsquedas y canciones que suenan, con `install_id` aleatorio
+  (UUID). Nunca se envía la IP: el backend la ve por la conexión y la guarda **hasheada**, así
+  el baneo se aplica por red sin que la app mande nada personal. Se puede apagar desde
+  Privacidad en la app.
+- **Baneo**: una red baneada no puede registrar eventos **ni crear o entrar a salas**.
+- **CLI** (`analytics/nxmctl.py`): se conecta al backend y muestra todo con vistas navegables
+  (resumen, usuarios, búsquedas, canciones, redes y salas), exporta a JSON y permite banear una
+  red o cerrar una sala.
+
+```bash
+cd analytics && python3 nxmctl.py            # panel interactivo (teclas 1-5, salas con 0)
+python3 nxmctl.py rooms                      # salas activas
+python3 nxmctl.py close-room XL89MR          # cerrar una sala
+python3 nxmctl.py export                     # respaldo completo en JSON
+```
+
+> El Postgres del plan gratis de Render caduca a los 30 días: antes de esa fecha, corre
+> `nxmctl.py export` y guarda el JSON.
+
+## Requisitos de build
+
+> Nota: esta sección es documentación interna del equipo de Nexus Studios. NexusMusic es
+> software de código cerrado — el repositorio y el código fuente no se distribuyen fuera del
+> equipo. Lo que se publica públicamente es el APK compilado y firmado.
+
+| Requisito | Versión | Nota |
+|---|---|---|
+| JDK | **17** | Obligatorio. Se verifica con `java -version` |
+| Android SDK | API 35 | `compileSdk 35` / `targetSdk 35` |
+| build-tools | **35.0.0** | Necesario para `zipalign` y `apksigner` al firmar |
+| Gradle | 8.7 | Wrapper incluido — no hace falta instalarlo |
+| kotlin / ksp | 2.0.10 / 2.0.10-1.0.24 | Gestionados por el wrapper y `libs.versions.toml` |
+
+Configura el SDK con `ANDROID_HOME` o con un `local.properties` en la raíz:
+
+```properties
+sdk.dir=/ruta/a/Android/Sdk
+```
+
+> `local.properties` está en `.gitignore` — nunca se sube.
+
+## Variantes de build
+
+El proyecto tiene dos *flavors* (`version`) × dos *tipos* (`debug` / `release`):
+
+| Flavor | Contenido | Requiere `google-services.json` |
+|---|---|---|
+| `foss` | Sin Google Play Services. Build limpio y reproducible | No |
+| `full` | Firebase (Analytics, Crashlytics, Config, Perf) + ML Kit | Sí |
+
+| Tipo | `applicationId` | Optimización |
+|---|---|---|
+| `debug` | `com.nexusmusic.app` **+ `.debug`** | Sin R8, sin recorte de recursos |
+| `release` | `com.nexusmusic.app` | R8 + `shrinkResources` + sin `crunchPngs` |
+
+> Al ser `applicationId` distintos, **debug y release se pueden instalar en paralelo**. Para
+> instalar release encima de debug hay que desinstalar antes (firmas distintas).
+
+El APK es **universal** (todas las ABI en un solo archivo): el bloque `splits { abi }` está
+desactivado a propósito en `app/build.gradle.kts`.
+
+## Compilar paso a paso
+
+Todo se ejecuta desde la raíz del repositorio (`rootProject.name = "NexusMusic"`; la carpeta
+local puede llamarse de cualquier otra forma, `velqi_files/` en la landing es un resto antiguo).
+
+### 1. Verificación rápida de tipos (lo más rápido, sin empaquetar)
+
+```bash
+./gradlew :app:compileFossReleaseKotlin
+```
+
+### 2. Debug (desarrollo y testeo en dispositivo)
+
+```bash
+./gradlew :app:assembleFossDebug
+```
+
+Salida: `app/build/outputs/apk/foss/debug/app-foss-debug.apk` (~25 MB).
+
+### 3. Release optimizado (el que se distribuye)
+
+```bash
+./gradlew :app:assembleFossRelease
+```
+
+Salida: `app/build/outputs/apk/foss/release/app-foss-release.apk` (~7,7 MB, **firmado** con
+`nexusmusic-release.jks`).
+
+Si la keystore **no** está en la raíz, el build continúa y deja el APK sin firmar como
+`app-foss-release-unsigned.apk`; en ese caso hay que firmarlo a mano (ver
+[Firmar el release](#firmar-el-release)).
+
+R8 + recorte de recursos bajan el APK de ~25 MB a ~7,7 MB. En este entorno tarda ~20-60 s en
+caliente; la primera vez (sin caché de Gradle) puede pasar de 5 minutos.
+
+### 4. APK completo (con Firebase)
+
+```bash
+./gradlew :app:assembleFullRelease
+```
+
+Necesita `google-services.json` en `app/`. Un build cuyo nombre de tarea **no** contenga `foss`
+activa automáticamente los plugins de Firebase (`isFullBuild` en `build.gradle.kts` raíz).
+
+### 5. Limpieza
+
+```bash
+./gradlew clean          # limpia build/ de todos los módulos
+./gradlew --stop         # detiene el daemon de Gradle (útil si algo queda trabado)
+```
+
+## Firmar el release
+
+`./gradlew :app:assembleFossRelease` **firma el APK automáticamente** cuando la keystore está en
+la raíz: `signingConfigs.release` se asigna a `buildTypes.release.signingConfig` en
+`app/build.gradle.kts`. La keystore vive fuera del control de versiones
+(`nexusmusic-release.jks`, en `.gitignore`) y no se comparte.
+
+Si la keystore **no** está presente, el build no falla: sigue adelante y entrega
+`app-foss-release-unsigned.apk` sin firmar. Para ese caso (o para re-firmar a mano) usa el flujo
+`zipalign` + `apksigner`:
+
+**Credenciales** (mismas que usa `signingConfigs.release` en `app/build.gradle.kts`):
+
+| Dato | Valor |
+|---|---|
+| Archivo | `nexusmusic-release.jks` (raíz del proyecto) |
+| Alias | `nexusmusic` |
+| Contraseña de store | `NXM_STORE_PASSWORD` (variable de entorno o `local.properties`) |
+| Contraseña de clave | `NXM_KEY_PASSWORD` (variable de entorno o `local.properties`) |
+
+> ⚠️ **No hay contraseña por defecto y no se escribe aquí.** La que estuvo publicada en una
+> versión anterior de este documento (bajo el nombre antiguo del proyecto) queda **comprometida**:
+> cualquiera que consiguiera el `.jks` podía firmar un APK aceptado como actualización. El build
+> **falla** si faltan las variables al pedir un release, en vez de firmar con un secreto conocido.
+> Pendiente: **rotar la keystore** (nadie tiene instalada la 0.5.0, así que el cambio de firma no
+> rompe a nadie).
+
+Firma manual de respaldo con `zipalign` + `apksigner`:
+
+```bash
+BT="$ANDROID_HOME/build-tools/35.0.0"
+
+# 1) Alinear el APK (obligatorio antes de firmar)
+"$BT/zipalign" -f -p 4 \
+  app/build/outputs/apk/foss/release/app-foss-release-unsigned.apk \
+  /tmp/nxm-aligned.apk
+
+# 2) Firmar
+"$BT/apksigner" sign \
+  --ks nexusmusic-release.jks \
+  --ks-key-alias nexusmusic \
+  --ks-pass env:NXM_STORE_PASSWORD \
+  --key-pass env:NXM_KEY_PASSWORD \
+  --out NexusMusic-0.6.4-release.apk \
+  /tmp/nxm-aligned.apk
+
+# 3) Verificar la firma (imprime el certificado)
+"$BT/apksigner" verify --print-certs NexusMusic-0.6.4-release.apk
+```
+
+Salida esperada del paso 3: `Signer #1 certificate DN: CN=NexusMusic, ...` y
+`Signer #1 certificate SHA-256 digest: b37ab893...`.
+
+> **Guarda la keystore y sus contraseñas.** Perderla significa que no podrás volver a
+> actualizar la app firmada: Android rechaza cualquier APK firmado con otra clave.
+
+## Instalar y probar
+
+```bash
+# Dispositivo por USB
+adb install -r NexusMusic-0.6.4-release.apk
+
+# Emulador / Waydroid por red
+adb connect 192.168.240.112:5555
+adb install -r NexusMusic-0.6.4-release.apk
+
+# Desinstalar y empezar de cero (borra biblioteca local y sesión)
+adb uninstall com.nexusmusic.app
+```
+
+Comprobación rápida de que la app está viva y reproduciendo:
+
+```bash
+adb shell dumpsys media_session | grep -E "state=PlaybackState"
+# state=3 -> reproduciendo · state=2 -> pausado · error=null -> sin errores
+```
+
+## Logs y diagnóstico
+
+Tags útiles de `logcat`:
+
+| Tag | Qué muestra |
+|---|---|
+| `KernelVelqi` | Resolución de streams: `itag`, si es muxed, **cliente ganador**, `pot=`, intento con PoToken y URL (recortada) |
+| `PoTokenGenerator` / `PoTokenWebView` | Ciclo de vida del BotGuard: WebView, `botguardResponse`, minter, token generado |
+| `VelqiRPC` | Discord Rich Presence (gateway, presencia enviada) |
+| `Timber` (resto) | Errores de red, sesión y parseo |
+
+```bash
+# Solo lo importante, en vivo
+adb logcat -c                      # limpia el buffer
+adb logcat | grep -E "KernelVelqi|PoToken|VelqiRPC"
+
+# Volcado de todo el buffer a un archivo
+adb logcat -d > logcat.txt
+```
+
+Lectura del log de reproducción:
+
+```
+KernelVelqi: stream itag=18 muxed=true cliente=ANDROID pot=false intento=null url=...
+```
+
+- `cliente=` → cliente que entregó los streams (`ANDROID`, `IOS`, `ANDROID+pot`, `WEB_REMIX+pot`,
+  `ANDROID_VR`, `TVHTML5+piped`).
+- `pot=true/false` → si la URL **que se está reproduciendo** lleva token de atestación. En los
+  muxed (`muxed=true`) siempre es `false`: el itag 18 no consulta el `pot`.
+- `intento=` → resultado del intento con PoToken; `null` cuando **no fue necesario** levantarlo, y
+  `sin PoToken (BotGuard frio, calentando o no disponible)` cuando no estaba listo a tiempo.
+
+## Resolución de streams y anti-bot
+
+La obtención de streams vive en `innertube/YouTube.kt` → `player()`. La estrategia está
+**medida contra la API real**, no asumida:
+
+| Paso | Cliente | Estrategia |
+|---|---|---|
+| 1 | `ANDROID` (con cookie de sesión si existe) | Camino normal. En la práctica responde `OK` siempre |
+| 2 | `IOS` | Respaldo del anterior |
+| 3 | `ANDROID` + **PoToken** | Solo si los anteriores devolvieron muro anti-bot (`LOGIN_REQUIRED` / *"not a bot"*). Es el cliente que **mejor** entrega streams (muxed itag 18 + adaptativos con rangos completos), así que el rescate no depende del cliente web. El WebView se levanta **únicamente aquí** y **nunca bloquea la reproducción**: si el BotGuard todavía está frío, devuelve `null` y termina de arrancar en segundo plano |
+| 4 | `WEB_REMIX` + **PoToken** | Respaldo del anterior (camino histórico, medido sin sesión) |
+| 5 | `ANDROID_VR` | Último recurso móvil |
+| 6 | `TVHTML5` + piped | Fallback histórico para streams muxed |
+
+Resultados medidos desde una red de datacenter (Waydroid) con y sin sesión:
+
+| Cliente | Resultado |
+|---|---|
+| `ANDROID` | ✅ `OK`, 25 formatos |
+| `IOS` | ✅ `OK`, 23 formatos |
+| `ANDROID_VR` | ❌ `LOGIN_REQUIRED` — *"Sign in to confirm you're not a bot"* |
+| `WEB_REMIX` / `WEB` | ❌ `UNPLAYABLE` — *"Video unavailable"* (desde esa red) |
+| `TVHTML5` | ❌ *"YouTube is no longer supported in this application"* |
+| `ANDROID` + pot | ⏳ ronda nueva: pendiente de medir en dispositivo. El `intento=` del log y la telemetría
+  de muro (ver abajo) dicen si gana a `WEB_REMIX+pot` |
+
+### Cómo funciona el PoToken
+
+El PoToken (*Proof of Origin Token*) es la prueba de que la petición viene de un navegador
+legítimo. El módulo `zemer-cipher` resuelve el desafío de BotGuard de YouTube dentro de un
+**WebView invisible** y devuelve dos tokens:
+
+- `playerRequestPoToken` → token **ligado a la sesión** (`visitorData`); viaja en el cuerpo de
+  la petición a `/player` como `serviceIntegrityDimensions.poToken`.
+- `streamingDataPoToken` → token **ligado al video**; se añade como `pot=` a la URL del stream.
+  Sin él, googlevideo puede servir solo el primer ~1 MB (corta al hacer seek).
+
+Reglas de diseño ya implementadas (no romper):
+
+1. **El PoToken nunca va primero.** Si los clientes móviles responden `OK`, el WebView no se
+   levanta y la reproducción no paga los ~2-5 s de su arranque.
+2. **El `pot=` solo se inyecta cuando la respuesta web es la que se va a reproducir.** Añadirlo
+   a URLs de clientes Android no aporta y ensucia el diagnóstico.
+3. **Si falla, no rompe nada:** la cadena sigue con los clientes móviles, y todo error transitorio
+   del BotGuard se traduce en `null` — nada de ahí puede lanzar hacia el reproductor.
+4. **Un BotGuard frío no bloquea:** el arranque en frío se espera como máximo **3 s**. Si no llega,
+   la cadena sigue sin PoToken y el WebView termina de inicializar en segundo plano para la
+   siguiente canción; el reintento de `/player` (3 s tras un muro) es lo que convierte esa segunda
+   vuelta en música en vez de en un error.
+5. **El `pot=` solo se añade a streams adaptativos:** el muxed (itag 18) sirve el archivo completo
+   con rangos ilimitados y no consulta el token.
+6. **El orden del rescate se mide, no se asume.** Cada intento con PoToken queda en `intento=`
+   (log) y los muros se reportan como *no-fatal* (`BotWallException`, ver abajo), así que la ruta
+   ganadora se decide con datos de campo y no con intuición.
+
+### Qué dispara el muro anti-bot y qué lo mata
+
+El muro (`Sign in to confirm you're not a bot`) no es aleatorio: lo dispara la **reputación de la
+IP** sumada a la **falta de atestación**. En orden de eficacia:
+
+| Palanca | Quién la sufre / quién la resuelve |
+|---|---|
+| **Sesión iniciada** | Es lo que **mata** el muro y es la única solución de fondo. Se captura desde
+  el WebView de login (`Ajustes → YouTube Music`) y es **la misma cookie** que desbloquea tus
+  playlists de YouTube Music: no hay que exportar nada a mano |
+| **PoToken** | Rescate invisible sin cuenta: cubre el caso de quien no quiere iniciar sesión |
+| **IP** | Un usuario normal (casa, datos móviles) **casi nunca** lo topa; los que lo topan son
+  VPN, proxies y redes de datacenter — justo el escenario de un emulador |
+
+Y para no ir a ciegas: cuando el muro aparece, el resolver reporta un **no-fatal** (`reportException`
+→ Crashlytics en el flavor `full`, log en `foss`) con el detalle de qué cliente se usó, si hubo
+rescate y si había sesión. Así la frecuencia y la eficacia se miden en campo en vez de suponerse.
+
+> **Autenticación por familia de cliente:** los clientes móviles (`ANDROID`, `IOS`) se autentican
+> solo con la cookie. La familia **web** (`WEB`, `WEB_REMIX`) exige además
+> `Authorization: SAPISIDHASH <ts>_<sha1("<ts> <SAPISID> https://music.youtube.com")>` — enviar
+> la cookie **sin** esa firma equivale a ir sin sesión, que es exactamente lo que dispara el muro.
+> `/player` ahora firma cuando el cliente es web.
+
+## Problemas comunes
+
+| Síntoma | Causa y solución |
+|---|---|
+| *"Sign in to confirm you're not a bot"* en el reproductor | Muro anti-bot de YouTube. Abre **Ajustes → YouTube Music** e inicia sesión: con cookies las peticiones van autenticadas y el muro desaparece. También se activa solo el rescate con PoToken. Revisa `cliente=` e `intento=` en `KernelVelqi` para ver qué pasó |
+| La reproducción tarda ~2-5 s en empezar | El WebView del PoToken se está levantando. Debería pasar **una sola vez y solo tras un muro anti-bot**: en frío se espera 3 s como máximo y el resto del arranque sigue en segundo plano. Si se repite en cada canción, revisa el orden de clientes en `player()`; si el `visitorData` está vacío (`intento=` en `KernelVelqi`), el PoToken se omite y el muro nunca se resuelve |
+| Error de KSP con rutas de paquetes viejas | Caché de KSP tras mover/renombrar paquetes: `./gradlew clean` y recompilar (el daemon también con `./gradlew --stop`) |
+| `INSTALL_FAILED_UPDATE_INCOMPATIBLE` | El APK release está firmado con otra clave que el instalado (o hay debug instalado). `adb uninstall com.nexusmusic.app` y reinstalar |
+| El APK release no se instala encima del debug | Son apps distintas por `applicationId` (`.debug`); desinstala el debug si quieres el mismo paquete |
+| `signingConfig` no encuentra la keystore | `nexusmusic-release.jks` no está en la raíz del proyecto. Sin ella, compila sin firmar (`app-foss-release-unsigned.apk`) |
+| Waydroid/emulador no aparece en `adb devices` | `adb connect <ip>:5555` (Waydroid suele ser `192.168.240.112`) |
+| Playlists no aparecen tras iniciar sesión | YouTube entrega playlists privadas solo a sesiones completas. Cierra la app y ábrela; si persiste, **Cerrar sesión** y volver a capturar la sesión eligiendo la cuenta correcta |
+
+## API (YouTube Music / InnerTube)
+
+NexusMusic no depende de servicios de terceros para el contenido: se comunica directamente con
+el **cliente InnerTube** de YouTube Music — la misma API interna que usa la aplicación oficial.
+Toda la implementación vive en el módulo `innertube` (`com.nexusmusic.app.innertube`).
+
+Endpoints principales expuestos:
+
+| Endpoint | Uso | Página tipada |
+|---|---|---|
+| `browse` | Home, explorar, álbumes, artistas, playlists | `HomePage`, `AlbumPage`, `ArtistPage`, `PlaylistPage` |
+| `search` | Búsqueda global y sugerencias | `SearchPage`, `SearchSuggestionPage` |
+| `player` | Obtención de streams para reproducir | `PlayerResponse` |
+| `next` | Cola y canciones relacionadas | `NextPage`, `RelatedPage` |
+
+Reglas de uso:
+
+- Todo el tráfico es HTTPS; las peticiones llevan un `context` de cliente (idioma, región y client version).
+- Las respuestas llegan como renderers de YouTube y el módulo las parsea a **modelos tipados**
+  (`models/`), que es lo único que consume el módulo `app`.
+- Si necesitas tocar algo de contenido: cambia solo lo que expone el módulo `innertube`;
+  la capa de UI nunca habla con la API directamente.
+- No modifiques la lógica de obtención de streams sin validar en dispositivo: cualquier cambio
+  ahí afecta la reproducción global de la app.
+- La sesión se captura del `CookieManager` del WebView de login (misma autenticación que la web:
+  `SAPISID` + `SAPISIDHASH`). No hay atajos ni credenciales guardadas en texto plano fuera del
+  almacén de preferencias de la app.
+
+## Testear vía código
+
+```bash
+./gradlew :app:compileFossDebugKotlin   # verificación de tipos (rápida)
+./gradlew :app:lintFossDebug            # linter de Android/Kotlin
+./gradlew :innertube:test               # tests unitarios del cliente InnerTube
+./gradlew :selene:test                  # tests unitarios de selene (browse/search/next/queue)
+./gradlew :kugou:test                   # tests unitarios del cliente de letras KuGou
+```
+
+Instalación directa en dispositivo/emulador:
+
+```bash
+adb install -r app/build/outputs/apk/foss/debug/app-foss-debug.apk
+```
+
+La estrategia de testing es conservadora: los cambios deben validarse en dispositivo real
+(reproducción, colas, letras y RPC) antes de fusionar. Checklist mínimo por cambio:
+
+1. `./gradlew :app:compileFossReleaseKotlin` sin errores.
+2. Reproducción real con `cliente=ANDROID` en el log y `error=null` en `dumpsys media_session`.
+3. Saltar 2-3 canciones y confirmar que la resolución sigue siendo inmediata.
+
+## Un producto de Nexus Forge
+
+NexusMusic es un producto propio del **escaparate de [Nexus Forge](https://nexusforgex.vercel.app)**,
+la plataforma de Nexus Studios: un ecosistema para creadores y desarrolladores. Cuenta con
+**membresía de desarrollador** y un lugar en su plataforma, y por eso la app sigue gratis y sin
+anuncios.
+
+Se ve en dos lugares de la app: el **aviso de bienvenida** que sale una sola vez (al instalar o
+al actualizar a la 0.6.4) y su **pantalla propia en Ajustes → Nexus Forge**, con el logo, los datos
+de su plataforma y el enlace directo. Los textos están en `values/`, `values-es/` y
+`values-es-rUS/`; el logo vive en `app/src/main/res/drawable-nodpi/nexus_logo_small.png` y en
+`landing/assets/nexus-logo.png`.
+
+Gracias a Nexus Studios por el respaldo.
+
+## Reportar problemas
+
+Este repositorio es privado y de uso interno de Nexus Studios — no se aceptan colaboradores
+externos ni Pull Requests de terceros.
+
+1. **Acceso**: el código, la keystore, los secretos y las credenciales de publicación son
+   internos de Nexus Studios y no se comparten con nadie fuera del equipo.
+2. **Reportar un bug** (bienvenido para usuarios de la app): abre un issue o contacta a Nexus
+   Forge con los pasos de reproducción, la versión instalada y los logs relevantes (`adb logcat`,
+   filtrando por `ListeningRoom` para las salas o por `KernelVelqi` para el reproductor).
+3. **Verificación de seguridad**: al ser una app de código cerrado, cualquier usuario puede
+   verificar el APK distribuido con su antivirus o con un servicio como VirusTotal antes de
+   instalarlo.
+4. **Estilo del código** (referencia interna del equipo): Kotlin + Compose, comentarios y
+   nombres en español, textos de interfaz siempre en `values/`, `values-es/` y `values-es-rUS/`,
+   y la lógica de cada función explicada en el propio archivo.
+
+## Estado
+
+- **Versión**: 0.6.4 (`versionCode` 34)
+- **APK release**: universal y firmado, ~8 MB
+- **Respaldo**: [Nexus Forge](https://nexusforgex.vercel.app) (Nexus Studios) — membresía de desarrollador y escaparate de proyectos
+- **Visibilidad**: privado — **código cerrado**, todos los derechos reservados
+- **Backend**: Render (plan gratis) + Postgres, con CLI de administración en `analytics/nxmctl.py`
+- **Propósito del repo**: desarrollo interno del equipo
+- **Distribución**: APK oficial en <https://openytmusic.netlify.app>
+
+## Licencia
+
+**Software propietario — todos los derechos reservados.** NexusMusic es un producto cerrado de
+Nexus Forge / Nexus Studios. El código fuente **no** se publica ni se pone a disposición del
+público. Queda prohibido copiar, descompilar, modificar, redistribuir o explotar comercialmente
+la aplicación sin autorización escrita previa.
+
+No hacer pública la fuente no significa que la app no pueda verificarse: cualquiera puede
+analizar el APK distribuido con un antivirus o con un servicio como VirusTotal antes de
+instalarlo, sin necesidad de acceso al código.
+
+El texto completo (en español e inglés) está en [`LICENSE`](LICENSE), junto con el aviso de
+terceros: los módulos `material-color-utilities` (Apache 2.0), `lrclib`, `kugou`,
+`innertube`, `selene`, `discord-rpc` y `zemer-cipher` conservan su licencia original, y partes
+del cliente derivan de proyectos GPL-3.0 — esas licencias de terceros siguen aplicando sobre
+esas partes del código independientemente del estatus del resto del proyecto.
+
+## Disclaimer
+
+Este proyecto y su contenido no están afiliados, financiados, autorizados, respaldados ni
+asociados de ninguna forma con YouTube, Google LLC ni sus afiliados y subsidiarias. Cualquier
+marca comercial, servicio o propiedad intelectual de terceros mencionada pertenece a sus
+respectivos dueños.
